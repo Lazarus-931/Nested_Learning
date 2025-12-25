@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from typing import Any
+
 import flax
 import jax
 import flax as nn
@@ -15,7 +17,7 @@ class MemoryLayerArgs:
 class MemoryMLP(nnx.Module):
     def __init__(self, dim: int, num_layers: int, hidden_mult: int):
         super().__init__()
-        hidden = num_layers * hidden_mult
+        self.hidden = dim * hidden_mult
         self.num_layers = num_layers
         self.dim = dim
         self.variable = None
@@ -95,9 +97,10 @@ class Memory(nnx.Module):
         # Create output gating components
         self.gate_norm = nnx.LayerNorm(config.dim)
         self.gate_proj = nnx.Dense(config.dim)
+        self.micro_chunk: int = 16
 
 
-    def loss_function(self, k_t: int, v_t: int, memory_params) -> jnp.ndarray:
+    def loss_function(self, memory_params, v_t: int, k_t: int) -> jnp.ndarray:
         """
         Associative Memory loss based on equation 12, or called Momentary Surprise.
 
@@ -114,7 +117,7 @@ class Memory(nnx.Module):
         loss = jnp.sum((prediction - v_t) ** 2)
         return loss
 
-    def update_memory(self, memory_params, momentum_state, x_t, eta_t, theta_t):
+    def update_memory(self, memory_params, momentum_state, x_t):
         """
         This function updates the memory state based on two factors:
             1. Previous Memory State
@@ -131,25 +134,47 @@ class Memory(nnx.Module):
         :param theta_t: learning rate
         :return: nothing, updates the memory network
         """
-        alpha_logit = self.alpha_m(x_t)
+
+        eta_t = jax.nn.sigmoid(self.eta_net(x_t))
+        theta_t = jax.nn.softplus(self.theta_net(x_t))
+
+
+        alpha_logit = self.alpha_net(x_t)
         alpha_sig = jax.nn.sigmoid(alpha_logit)
 
-        k_t = x_t @ self.W_K
-        v_t = x_t @ self.W_V
+        k_t = self.W_K(x_t)
+        v_t = self.W_V(x_t)
 
-        loss_fn = lambda params: jnp.sum((self.memory_forward(params, k_t) - v_t) ** 2)
+        loss_fn = lambda params: jnp.sum((self.memory_mlp.apply(params, k_t) - v_t) ** 2)
 
-        gradient = jax.grad(loss_fn)(memory_params)
+        gradient = jax.grad(self.loss_function)(memory_params, k_t, v_t)
 
         new_momentum_state = (eta_t * momentum_state) - (theta_t * gradient)
 
         new_memory_params = jax.tree_map(
-            lambda s, m: s + ((1 - alpha_sig) * m),
+            lambda m, s: s + m,
             memory_params,
             new_momentum_state
         )
 
         return new_memory_params, new_momentum_state
+
+    def update_memory_with_chunking(self, memory_params, momentum, x_chunks, micro_chunk: int):
+        """This is similar to update memory, but instead it process chunk of 16 in parallel.
+        Section 3.2 in code basically
+        :param micro_chunk: the size of the micro chunk
+        :param x_chunks: Chunks of tokens, size (16, dim)
+        :param memory_params: the previous memory network weights( at t-1 )
+        :param momentum: Momentum weights ( at t-1 )
+        """
+        for i in range(micro_chunk):
+            memory_params, momentum = self.update_memory(
+                memory_params,
+                momentum,
+                x_chunks[i]
+            )
+
+        return memory_params, momentum
 
 
     def __call__(self, query: jnp.ndarray) -> jnp.ndarray:
@@ -167,6 +192,83 @@ class Memory(nnx.Module):
 
         return output
 
+    def forgetting_mechanism(self, memory_params, momentum_state, x_t):
+        """
+        This function provides the right method to forget certain aspects from the titan's memory. This, while similar
+        to the update method, makes sure memory does not get bloated. If alpha is 0, nothing is removed, closer it is to 1,
+        the more is removed. alpha ∈ [0, 1]
+
+
+        :param memory_params: This is the previous memory network weights( at t-1 )
+        :param momentum_state: Previous momentum weights ( at t-1 ), also known as past surprise
+        :param x_t: input (i.e token) at time t
+        :param eta_t: momentum decay coefficient
+        :param theta_t: learning rate
+        :return: forgets memory artifacts
+        """
+
+        eta_t = jax.nn.sigmoid(self.eta_net(x_t))
+        theta_t = jax.nn.softplus(self.theta_net(x_t))
 
 
 
+        alpha_logit = self.alpha_net(x_t)
+        alpha_sig = jax.nn.sigmoid(alpha_logit)
+
+        k_t = self.W_K(x_t)
+        v_t = self.W_V(x_t)
+
+        loss_fn = lambda params: jnp.sum((self.memory_mlp.apply(params, k_t) - v_t) ** 2)
+
+        gradient = jax.grad(self.loss_function)(memory_params, k_t, v_t)
+
+        new_momentum_state = (eta_t * momentum_state) - (theta_t * gradient)
+
+        new_memory_params = jax.tree_map(
+            lambda s, m: ((1 - alpha_sig) * m) + s,
+            memory_params,
+            new_momentum_state
+        )
+
+        return new_memory_params, new_momentum_state
+
+    def chunk_sequence(self, x: jnp.ndarray, chunk_size: int) -> list[jnp.ndarray]:
+        """
+        Method for context memory, chunks sequence of inputs into manageable for significant decrease in
+        total memory overhead.
+
+        :param chunk_size: represents the segment sie
+        :param x: input the size of (N, dim)
+        :return: chunked segments, each (C, dim)
+        """
+
+        N = x.shape[0]
+
+        num_chunks = N // chunk_size
+
+        segments = []
+
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = start + chunk_size
+            segment = x[start:end]
+            segments.append(segment)
+
+        if N % chunk_size != 0:
+            segments.append(x[num_chunks * chunk_size:])
+
+        return segments
+
+
+
+    def apply_convolution(self, x):
+        """"
+        1D deptwise-seperable convolution which, which applies convolution to every query, key and value projections.
+        For computatinoal efficienty.
+        :param x: input (N, dim)
+        """
+
+        self.deptwise = jax.lax.conv_general_dilated(
+            lhs=x,
+            rhs=dw_kernel
+        )
