@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import flax
 import jax
@@ -159,23 +159,67 @@ class Memory(nnx.Module):
 
         return new_memory_params, new_momentum_state
 
-    def update_memory_with_chunking(self, memory_params, momentum, x_chunks, micro_chunk: int):
-        """This is similar to update memory, but instead it process chunk of 16 in parallel.
-        Section 3.2 in code basically
-        :param micro_chunk: the size of the micro chunk
-        :param x_chunks: Chunks of tokens, size (16, dim)
-        :param memory_params: the previous memory network weights( at t-1 )
-        :param momentum: Momentum weights ( at t-1 )
+    def update_memory_chunked(
+            self,
+            memory_params,
+            momentum,
+            x_chunk,
+            use_forgetting: bool = True
+    ):
         """
-        for i in range(micro_chunk):
-            memory_params, momentum = self.update_memory(
+        Process chunk in parallel.
+
+        Args:
+            use_forgetting:
+                True = Equations 13-14 (with forgetting - final design)
+                False = Equations 9-10 (momentum only - ablation)
+        """
+        # Project to K, V
+        k_chunk = jax.vmap(self.W_K)(x_chunk)
+        v_chunk = jax.vmap(self.W_V)(x_chunk)  # ← Fixed
+
+        # Compute gradients in parallel
+        def compute_single_gradient(k, v):
+            return jax.grad(self.loss_function)(memory_params, k, v)
+
+        gradients = jax.vmap(compute_single_gradient)(k_chunk, v_chunk)  # ← Fixed
+
+        # Compute hyperparameters
+        etas = jax.vmap(lambda x: jax.nn.sigmoid(self.eta_net(x)))(x_chunk)
+        thetas = jax.vmap(lambda x: jax.nn.softplus(self.theta_net(x)))(x_chunk)  # ← Fixed
+
+        # Update momentum (Equation 14 - same for both modes)
+        def momentum_update_op(carry, inputs):
+            momentum_prev = carry
+            eta, theta, grad = inputs
+            momentum_new = eta * momentum_prev - theta * grad
+            return momentum_new, momentum_new
+
+        _, momentums = jax.lax.scan(
+            momentum_update_op,
+            momentum,
+            (etas, thetas, gradients)
+        )
+
+        final_momentum = momentums[-1]
+
+        if use_forgetting:
+            alphas = jax.vmap(lambda x: jax.nn.sigmoid(self.alpha_net(x)))(x_chunk)
+            final_alpha = alphas[-1]
+
+            new_memory_params = jax.tree_map(
+                lambda m, s: (1 - final_alpha) * m + s,
                 memory_params,
-                momentum,
-                x_chunks[i]
+                final_momentum
+            )
+        else:
+            new_memory_params = jax.tree_map(
+                lambda m, s: m + s,
+                memory_params,
+                final_momentum
             )
 
-        return memory_params, momentum
-
+        return new_memory_params, final_momentum
 
     def __call__(self, query: jnp.ndarray) -> jnp.ndarray:
         """
@@ -260,15 +304,3 @@ class Memory(nnx.Module):
         return segments
 
 
-
-    def apply_convolution(self, x):
-        """"
-        1D deptwise-seperable convolution which, which applies convolution to every query, key and value projections.
-        For computatinoal efficienty.
-        :param x: input (N, dim)
-        """
-
-        self.deptwise = jax.lax.conv_general_dilated(
-            lhs=x,
-            rhs=dw_kernel
-        )
