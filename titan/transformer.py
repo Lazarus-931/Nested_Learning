@@ -1,10 +1,6 @@
-import flax
 import jax.numpy as jnp
-import numpy as np
-import jax.nn as jnn
-import jax.lax as lax
 
-from memory import MemoryLayerArgs, MemoryMLP, TitanMemory
+from models.titan.memory import MemoryLayerArgs, TitanMemory
 
 from flax import nnx
 

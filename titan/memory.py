@@ -1,12 +1,65 @@
 from dataclasses import dataclass
 from typing import Any, Literal
-
+from collections import namedtuple
+from einops import einsum, reduce, rearrange
 import flax
 import jax
 import flax as nn
-import flax.linen as nnx
+import flax.linen as nnl
+from flax import nnx
 import jax.numpy as jnp
 
+
+def default(*args):
+    for arg in args:
+        if exists(arg):
+            return arg
+    return None
+
+def pair(v):
+    return (v, v) if not isinstance(v, tuple) else v
+
+# Multi head rmsnorm
+class MultiHeadRMSNorm(nnx.Module):
+    def __init__(self, dim, heads, rngs):
+        self.rmsnorm = nnx.RMSNorm(dim)
+        self.gamma = nnx.Param(jnp.zeros((heads, 1, dim)))
+
+    def __call__(self, x):
+        return self.rmsnorm(x) * (self.gamma + 1.)
+
+
+class AveragePool(nnx.Module):
+    def __init__(self, chunk_size):
+        super().__init__()
+        self.chunk_size = chunk_size
+
+
+    def __call__(self, x, chunk_size = None):
+        chunk_size = default(chunk_size, self.chunk_size)
+        return reduce(x, 'b (n c) d -> b n d', 'mean', c = chunk_size)
+
+class AttentionPool(nnx.Module):
+
+    def __init__(self, dim, chunk_size):
+        super().__init__()
+        self.dim = dim
+        self.chunk_size = chunk_size
+
+        self.to_attn_logits = flax.nnx.Linear(in_features=dim, out_features=dim)
+        nnx.zeros_init(self.to_attn_logits.weights)
+        nnx.zeros_init(self.to_attn_logits.bias)
+
+    def __call__(self, x, chunk_size = None):
+        chunk_size = default(chunk_size, self.chunk_size)
+
+        x = rearrange(x, 'b n d -> b (n d) c', c = chunk_size)
+
+        attn_logits = self.to_attn_logits(x)
+
+        attn = attn_logits.softmax(dim=-2)
+
+        return reduce(x * attn, 'b n d -> b (n d) c', 'sum')
 
 @dataclass
 class MemoryLayerArgs:
@@ -15,12 +68,14 @@ class MemoryLayerArgs:
     num_layers: int = 2,
 
 class MemoryMLP(nnx.Module):
-    def __init__(self, dim: int, num_layers: int, hidden_mult: int):
+    def __init__(self, dim: int, num_layers: int, hidden_mult: int, chunk_size: int, heads: int):
         super().__init__()
         self.hidden = dim * hidden_mult
         self.num_layers = num_layers
         self.dim = dim
         self.variable = None
+        self.heads = heads
+        self.chunk_size = chunk_size
 
     def __call__(self, x):
         h = x
@@ -33,7 +88,7 @@ class MemoryMLP(nnx.Module):
 
 
 class Memory(nnx.Module):
-    def __init__(self, config: MemoryLayerArgs, num_persistent: int = 16):
+    def __init__(self, config: MemoryLayerArgs, num_persistent: int = 16, chunk_size: int):
         super().__init__()
 
         # Store config
@@ -98,6 +153,7 @@ class Memory(nnx.Module):
         self.gate_norm = nnx.LayerNorm(config.dim)
         self.gate_proj = nnx.Dense(config.dim)
         self.micro_chunk: int = 16
+        self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
 
     def loss_function(self, memory_params, v_t: int, k_t: int) -> jnp.ndarray:
@@ -303,4 +359,6 @@ class Memory(nnx.Module):
 
         return segments
 
+    def retrieve_memory(self, seq, weight: dict[str, jax.Array]):
+        chunk_size = self.get_chunk_size
 
