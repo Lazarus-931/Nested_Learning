@@ -1,6 +1,6 @@
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict
 
 import flax
 import einops
@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import jax.numpy as jnp
+import optional
 from flax import nnx
 from functools import partial
 import flax.nnx.nn.linear as fnnl
@@ -31,15 +32,49 @@ MACAttention_Config = CausalConfig(
     flash = True
 )
 
+
 @dataclass
-class MAC_Config:
+class MACConfig:
     num_tokens: int
     dim: int
-    dept: int
+    depth: int
     segment_len: int
-    neural_mem_seg_len = None,
-    neural_meme_gate_attn_output = False
-    neural_mem_add_value
+    dim_head: int
+    heads: int
+    ff_mult: int
+    num_residual_streams: int
+
+    # optional
+    neural_mem_seg_len: Optional[int] = None
+    neural_mem_gate_attn_output: bool = False
+    neural_mem_add_value_res: bool = False
+    num_long_term_mem_tokens: int = 0
+    num_persist_mem_tokens: int = 0
+    neural_memory_batch_size: Optional[int] = None
+    neural_memory_qkv_receives_diff_views: bool = False
+    neural_memory_model: Optional[nn.Module] = None
+    neural_memory_kwargs: dict = None
+    neural_memory_layers: Optional[tuple[int, ...]] = None
+    use_flex_attn: bool = False
+    sliding_window_attn: bool = False
+    neural_mem_weight_residual: bool = False
+    token_emb: Optional[nn.Module] = None
+
+    def __post_init__(self):
+        if self.neural_memory_kwargs is None:
+            self.neural_memory_kwargs = {}
+
+config = MACConfig(
+    num_tokens=1024,
+    dim=512,
+    depth=32,
+    segment_len=8,
+    dim_head=64,
+    heads=8,
+    ff_mult=4,
+    num_residual_streams=4,
+
+)
 
 
 def terp(input, end, weight):
@@ -82,7 +117,9 @@ def pad_seg_with_inverse(seq, seg_len, fold_into_batch: bool = True, inverse_rem
 
         dim_inner= heads * dim_head
 
-        self.attn = CausalAttention.config = MACAttention_Config
+        CausalAttention.config = MACAttention_Config
+
+        self.attention = CausalAttention()
 
         self.to_qkv = LinearNoBias(dim, dim_inner * 3)
         self.to_out = LinearNoBias(dim_inner, dim)
@@ -187,10 +224,20 @@ def pad_seg_with_inverse(seq, seg_len, fold_into_batch: bool = True, inverse_rem
             out = out * output_gating
 
         return out, AttnIntermediates(original_v, next_cache)
+
+
 class MAC_Transformer(nn.Module):
-    def __init__(self, config: MAC_Config):
+    def __init__(self, config: MACConfig):
         self.token_emb = config.token_emb
+        self.segment_size = config.segment_len
+        self.layers = Mod
+
         super().__init__()
+
+    def __call__(self):
+        pass
+
+
 
 
 
