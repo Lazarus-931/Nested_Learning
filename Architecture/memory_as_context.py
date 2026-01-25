@@ -13,7 +13,7 @@ from flax import nnx
 from functools import partial
 import flax.nnx.nn.linear as fnnl
 
-from tools.attn import CausalAttention, CausalConfig
+from tools.attn import CausalAndSlidingAttention, CausalConfig
 from einops import rearrange, reduce, repeat
 
 from tools.rotary import RotaryEmbedding

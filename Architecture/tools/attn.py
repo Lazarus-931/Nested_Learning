@@ -17,7 +17,7 @@ class AttentionConfig:
     dropout: float = 0.0
     window_size: Optional[int] = None  # None = full causal, int = sliding window
     use_flash: bool = True
-    qk_norm: bool = False  # RMSNorm on queries and keys
+    qk_norm: bool = False
 
 
 class CausalAndSlidingAttention(nn.Module):
