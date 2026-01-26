@@ -27,8 +27,15 @@ config = HYPER_CMS_config(
     layer_id = 1,
     dynamic = True
 )
+
+config2 = mHC_CMS_config(
+    dim = 4,
+    depth = 4,
+    residual_streams = 4,
+    rate = 2,
+)
 class HYPER_CMS_Block(nn.Module):
-    def __init__(self, config: HYPER_CMS_config):
+    def __init__(self, config: HYPER_CMS_config, branch: nn.Module | None = None):
         super().__init__()
         self.dim = config.dim
         self.depth = config.depth
@@ -36,6 +43,7 @@ class HYPER_CMS_Block(nn.Module):
         self.rate = config.rate
         self.layer_id = config.layer_id
         self.dynamic = config.dynamic
+        self.branch = branch
         self.param("Static_beta", nn.ones_init(), self.rate)
         init_alpha = nn.initializers.zeros((self.dim, 1))
         init_alpha[(self.layer_id * self.dim): 1] = 1.0
@@ -74,19 +82,29 @@ class HYPER_CMS_Block(nn.Module):
 
         mix_h = alpha.transpose(-1, -2) @ residual
 
+        return mix_h, beta
 
+    def depth(self, mix_h, h_o, beta):
+        h = einops.einsum("blh,bln->blnh", h_o, beta) + mix_h[..., 1:, :]
+        return h
 
+    def __call(self, residual, *branch_args, **branch_kwargs):
 
+        branch_input, residual = self.width(residual)
 
-    def depth(self, residual):
+        branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
 
-    def __call__(x):
+        if not self.dynamic:
+            return branch_input
 
 
 class mHC_CMS_Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.params = sche.Schedule(config)
+        self.dim = config
+        self.layered_index = config.layered_index.layered_index
+        self.dynamic = config.dynamic
+
+
     def __call__(x):
 
