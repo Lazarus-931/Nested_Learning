@@ -58,8 +58,8 @@ def sinkhorn_knopp(log_alpha, iter: int = 20):
 
 
 
+# Vanilla Residual block
 
-# Vanilla Residual Block
 def default(v, d):
     return v if v is not None else d
 
@@ -105,32 +105,9 @@ class Residual_CMS_Block(nn.Module):
         branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
         return add_residual_fn(branch_output)
 
-@dataclass
-class HYPER_CMS_config:
-    dim: int
-    depth: int
-    residual_streams: int
-    rate: int
-    layer_id: int
-    dynamic: bool
-
-config = HYPER_CMS_config(
-    dim = 4,
-    depth = 4,
-    residual_streams = 4,
-    rate = 2,
-    layer_id = 1,
-    dynamic = True
-)
-
-config2 = mHC_CMS_config(
-    dim = 4,
-    depth = 4,
-    residual_streams = 4,
-    rate = 2,
-)
 
 
+# hyper-connection block
 class HYPER_CMS_Block(nn.Module):
     """Basic Hyper-Connections block"""
 
@@ -241,7 +218,7 @@ class HYPER_CMS_Block(nn.Module):
 
 
 
-
+# manifold contained cms block
 class mHC_CMS_Block(nn.Module):
 
     dim: int
@@ -254,23 +231,126 @@ class mHC_CMS_Block(nn.Module):
 
 
     def setup(self):
+        streams = self.num_residual_steams
+
+        init_alpha = jnp.zeros((streams, 1))
+        init_alpha0 = init_alpha.at[streams, 0].set(1.0)
+
+        self.static_alpha = self.param("static_alpha",
+                                       lambda key, shape: jnp.concatenate([init_alpha0, jnp.eye(streams)], axis=1),
+                                       (streams, streams + 1)
+                                       )
+
+        self.static_beta = self.param("static_beta",
+                                      nn.initializers.ones,
+                                      (streams,))
 
 
-    def width(self, residual):
-        global norm_h
 
-        if self.dynamic:
-            norm_h = self.layer_norm(residual)
+        self.dynamic_alpha_fn = self.param(
+            "dynamic_alpha_fn",
+            nn.initializers.zeros,
+            (self.dim, streams + 1)
+        )
+        self.pre_branch_scale = self.param(
+            "pre_branch_scale",
+            lambda key, shape: jnp.ones(shape) * 0.01,
+            (1,)
+        )
+        self.residual_scale = self.param(
+            "residual_scale",
+            lambda key, shape: jnp.ones(shape) * 0.01,
+            (1,)
+        )
+
+        self.dynamic_beta_fn = self.param(
+            "dynamic_beta_fn",
+            nn.initializers.zeros,
+            (self.dim,)
+        )
+
+        self.beta_scale = self.param("beta_scale",
+                                     lambda key, shape: jnp.ones(shape) * 0.01,
+                                     (1,))
+
+        self.norm = RMSNorm(self.dim)
+
+        if self.dropout_rate > 0:
+            self.dropout = nn.Dropout(rate=self.dropout_rate)
 
 
-        pass
+    def width(self, residuals):
+
+        streams = self.num_residual_steams
+
+        normed = self.norm(residuals)
+
+        wc_weight = jnp.einsum('...sd, de -> ...se', normed, self.dynamic_alpha_fn)
+
+        # Apply separate scales for pre and residual
+        alpha_scale = jnp.concatenate([
+            jnp.broadcast_to(self.pre_branch_scale, (1,)),
+            jnp.broadcast_to(self.residual_scale, (streams,))
+        ])
+        dynamic_alpha = wc_weight * alpha_scale
+
+        alpha = dynamic_alpha + self.static_alpha
+
+        alpha_pre = alpha[..., :1]
+        alpha_res = alpha[..., 1:]
+
+        alpha_pre = jax.nn.sigmoid(alpha_pre)
+        alpha_res = sinkhorn_knopp(alpha_res, self.sinkhorn_iters)
+
+        alpha = jnp.concatenate([alpha_pre, alpha_res], axis=-1)
+
+        dc_weight = jnp.einsum('...sd, d -> ...s', normed, self.dynamic_beta_fn)
+        dynamic_beta = dc_weight * self.beta_scale
+        beta = dynamic_beta + self.static_beta
+        beta = jax.nn.sigmoid(beta) * 2
+
+        mix_h = jnp.einsum('...se, ...sd -> ...ed', alpha, residuals)
+
+        branch_input = mix_h[..., 0, :]
+        residuals = mix_h[..., 1:, :]
+
+        return branch_input, residuals, beta
+
+
     def depth(self, branch_output, residuals, beta):
-        assert self.dynamic
 
+        output = jnp.einsum('...d, ...s -> ...sd', branch_output, beta)
+        result = output + residuals
 
+        if self.dropout_rate > 0:
+            result = self.dropout(result)
 
-        pass
+        return result
 
-    def __call__(x):
+    def decorate_branch(self, branch: Callable):
+        assert self.branch is None, 'branch already wrapped on init'
+
+        def forward_and_add_residual(residuals, *args, **kwargs):
+            branch_input, add_residual = self(residuals)
+            branch_output = branch(branch_input, *args, **kwargs)
+            return add_residual(branch_output)
+
+        return forward_and_add_residual
+
+    @nn.compact
+    def __call__(self, residuals, *branch_args, **branch_kwargs):
+
+        branch_input, residuals, beta = self.width_connection(residuals)
+
+        def add_residual_fn(branch_out):
+            (branch_out, *rest), tree_spec = tree_flatten(branch_out)
+            branch_out = self.depth_connection(branch_out, residuals, beta)
+            return tree_unflatten((branch_out, *rest), tree_spec)
+
+        if self.branch is None:
+            return branch_input, add_residual_fn
+
+        branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
+        return add_residual_fn(branch_output)
 
 
