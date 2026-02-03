@@ -12,27 +12,13 @@ from typing import Tuple, Callable, Optional
 import einops
 from functorch.dim import tree_flatten
 from torch.utils._cxx_pytree import tree_unflatten
-
+from src.cms.standard import RMSNorm
 from titan.memory import default
 
 
 
 
 # Some tools/utils
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    @nn.compact
-    def __call__(self, x):
-        scale = self.dim ** -0.5
-        gamma = self.param("gamma", nn.initializers.zeros, (self.dim,))
-
-        norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
-        normalized = x / (norm + 1e-8)
-        return (gamma + 1) * normalized * scale
 
 
 def L2Norm(x, axis=-1):

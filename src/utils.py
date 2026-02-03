@@ -37,7 +37,9 @@ class MuonState(NamedTuple):
     k: float
     t: float
 
-class Muon(nnx.Optimizer):
+class MultiScaleMomentumMuon(nnx.Optimizer):
+    """Multiscale momentum optimizer from pg 29 (7.2)"""
+
     def __init__(self,
                  initial_weights: int,
                  params,
@@ -69,6 +71,7 @@ class Muon(nnx.Optimizer):
     def __call__(self, x) -> optax.GradientTransformation:
         m1 = MuonState.M1.fla
         for _ in range(MuonState.k):
+            pass
 
 
 
